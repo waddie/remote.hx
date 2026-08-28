@@ -1,0 +1,216 @@
+#!/bin/sh
+# Copyright (C) 2026 Tom Waddington
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# hx-send - send a command to a running Helix with remote.hx loaded.
+#
+#   hx-send open ~/notes/todo.md
+#   hx-send open src/main.rs && hx-send goto 120
+#   hx-send --session work open Cargo.toml
+#   hx-send --list
+#
+# The target is resolved in this order: --session, then $HELIX_REMOTE (set in
+# every process the editor spawns), then the session file whose cwd matches
+# this directory, then a lone live session.
+
+set -eu
+
+usage() {
+    cat <<'USAGE'
+usage: hx-send [--session NAME] <command> [args...]
+       hx-send --list
+       hx-send --ping
+       hx-send --eval EXPR
+
+Commands are Helix typable commands, without the leading colon. One command
+per invocation; chain with && for more.
+USAGE
+}
+
+remote_dir() {
+    if [ -n "${HELIX_REMOTE_DIR:-}" ]; then
+        printf '%s\n' "$HELIX_REMOTE_DIR"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        printf '%s\n' "$XDG_RUNTIME_DIR/helix-remote"
+    else
+        printf '%s\n' "${TMPDIR:-/tmp}/helix-remote-${USER:-user}"
+    fi
+}
+
+field() { # field <file> <key>
+    sed -n "s/^$2=//p" "$1"
+}
+
+session_files() {
+    dir=$(remote_dir)
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.session; do
+        [ -e "$f" ] && printf '%s\n' "$f"
+    done
+}
+
+# Set ADDRESS and TOKEN from a session file.
+use_file() {
+    ADDRESS="$(field "$1" host):$(field "$1" port)"
+    TOKEN=$(field "$1" token)
+}
+
+# Ask a session whether it is alive. A dead one leaves its file behind, so the
+# file existing proves nothing.
+alive() { # alive <file>
+    reply=$(printf '%s\nping\n\n' "$(field "$1" token)" |
+        connect "$(field "$1" host)" "$(field "$1" port)" 2>/dev/null || true)
+    case $reply in
+        pong*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+list_candidates() { # session files whose cwd is this directory, else all
+    here=$(pwd)
+    matched=
+    for f in $(session_files); do
+        [ "$(field "$f" cwd)" = "$here" ] && matched="$matched $f"
+    done
+    if [ -n "$matched" ]; then
+        printf '%s\n' $matched
+    else
+        session_files
+    fi
+}
+
+report_ambiguous() {
+    printf 'hx-send: several live sessions, choose one with --session:\n' >&2
+    for f in "$@"; do
+        printf '  %s (%s)\n' "$(field "$f" session)" "$(field "$f" cwd)" >&2
+    done
+    exit 1
+}
+
+resolve() {
+    if [ -n "${SESSION:-}" ]; then
+        f="$(remote_dir)/$SESSION.session"
+        [ -f "$f" ] || die "no such session: $SESSION"
+        use_file "$f"
+        return
+    fi
+
+    # Set by the editor in every process it spawns, so anything started from
+    # inside Helix talks to that Helix without a lookup.
+    if [ -n "${HELIX_REMOTE:-}" ] && [ -n "${HELIX_REMOTE_TOKEN:-}" ]; then
+        ADDRESS=$HELIX_REMOTE
+        TOKEN=$HELIX_REMOTE_TOKEN
+        return
+    fi
+
+    set -- $(list_candidates)
+    [ $# -gt 0 ] || die "no Helix sessions found in $(remote_dir)"
+
+    # One candidate is the common case: use it and let the request itself
+    # report any trouble, rather than paying for a liveness check.
+    if [ $# -eq 1 ]; then
+        use_file "$1"
+        return
+    fi
+
+    # Otherwise the stale files have to be told from the live ones.
+    live=""
+    for f in "$@"; do
+        alive "$f" && live="$live $f"
+    done
+    # shellcheck disable=SC2086
+    set -- $live
+    case $# in
+        0) die "no live Helix sessions in $(remote_dir)" ;;
+        1) use_file "$1" ;;
+        *) report_ambiguous "$@" ;;
+    esac
+}
+
+die() { printf 'hx-send: %s\n' "$1" >&2; exit 1; }
+
+# Write a request to the editor and print its reply.
+talk() { # talk <verb> [args...]
+    host=${ADDRESS%:*}
+    port=${ADDRESS##*:}
+    {
+        printf '%s\n' "$TOKEN"
+        for part in "$@"; do printf '%s\n' "$part"; done
+        printf '\n'
+    } | connect "$host" "$port"
+}
+
+# A reply always arrives promptly, but the editor does not always close the
+# connection straight after sending it: a Steel error that was raised and
+# caught keeps the socket alive until the garbage collector runs. The timeout
+# bounds that wait; without it a client can hang indefinitely on an error.
+connect() {
+    if command -v nc >/dev/null 2>&1; then
+        nc -w "${HX_SEND_TIMEOUT:-5}" "$1" "$2"
+    elif [ -n "${BASH:-}" ] || command -v bash >/dev/null 2>&1; then
+        bash -c 'exec 3<>/dev/tcp/'"$1"'/'"$2"'; cat >&3; cat <&3'
+    else
+        die "neither nc nor bash is available to open a socket"
+    fi
+}
+
+send() { # send <verb> [args...]
+    reply=$(talk "$@")
+    [ -n "$reply" ] && printf '%s\n' "$reply"
+    case $reply in
+        error*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+SESSION=${HELIX_REMOTE_SESSION:-}
+MODE=cmd
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --session) [ $# -ge 2 ] || die "--session needs a name"; SESSION=$2; shift 2 ;;
+        --list) MODE=list; shift ;;
+        --ping) MODE=ping; shift ;;
+        --eval) MODE=eval; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+case $MODE in
+    list)
+        found=0
+        for f in $(session_files); do
+            found=1
+            printf '%s\t%s:%s\t%s\n' "$(field "$f" session)" \
+                "$(field "$f" host)" "$(field "$f" port)" "$(field "$f" cwd)"
+        done
+        [ "$found" = 1 ] || printf 'no sessions in %s\n' "$(remote_dir)"
+        exit 0
+        ;;
+    ping)
+        resolve
+        send ping
+        exit $?
+        ;;
+    eval)
+        [ $# -ge 1 ] || die "--eval needs an expression"
+        resolve
+        send eval "$1"
+        exit $?
+        ;;
+esac
+
+[ $# -ge 1 ] || { usage >&2; exit 1; }
+
+resolve
+
+# Arguments are passed through untouched: one line each, so paths may contain
+# spaces without any quoting rules.
+send cmd "$@"
