@@ -21,7 +21,6 @@
 ;;;   hx-send open ~/notes/todo.md
 ;;;   hx-send --session work open src/main.rs goto 120
 
-(require (prefix-in helix. "helix/commands.scm"))
 (require "helix/misc.scm")
 (require "helix/ext.scm")
 (require-builtin steel/filesystem)
@@ -29,24 +28,25 @@
 (require "src/server.scm")
 (require "src/discovery.scm")
 (require "src/dispatch.scm")
+(require "src/config.scm")
 
 (provide remote-start
   remote-stop
   remote-status
-  remote-list)
+  remote-list
+  remote-allow!
+  remote-deny!
+  remote-allow-denied!
+  remote-allow-all!
+  remote-allow-eval!)
 
-;;;; Configuration ;;;;
+;;;; Server settings ;;;;
 
 ;; Loopback only. Binding anything else would expose the editor to the network.
 (define host "127.0.0.1")
 
 ;; First port to try; the server walks upwards from here if it is taken.
 (define base-port 7979)
-
-;; Whether `eval` requests are honoured. Off by default: it hands any local
-;; process the whole engine. Set to #t in init.scm before remote-start to
-;; enable it.
-(define *eval-enabled* (box #f))
 
 ;;;; State ;;;;
 
@@ -64,30 +64,111 @@
 (define *session* (box #f))
 (define *token* (box #f))
 
-;;;; Command table ;;;;
+;; The policy this server started with. Configuration is read once, so a
+;; change made afterwards does not move the running server's ground.
+(define *allowed-commands* (box '()))
+(define *allow-any-command* (box #f))
 
-;; The commands reachable over the wire. This is the real access control: a
-;; name absent from the table cannot run at all. Built in small groups because
-;; a call with nine or more arguments inside a required module corrupts the
-;; next call's arguments in this Steel build.
-(define command-entries
-  (append
-    (list "open" helix.open "new" helix.new)
-    (list "goto" helix.goto "echo" helix.echo)
-    (list "buffer-next" helix.buffer-next "buffer-previous" helix.buffer-previous)
-    (list "buffer-close" helix.buffer-close "buffer-close!" helix.buffer-close!)
-    (list "buffer-close-others" helix.buffer-close-others)
-    (list "vsplit" helix.vsplit "hsplit" helix.hsplit)
-    (list "vsplit-new" helix.vsplit-new "hsplit-new" helix.hsplit-new)
-    (list "quit" helix.quit "quit!" helix.quit!)
-    (list "reload" helix.reload "reload-all" helix.reload-all)
-    (list "theme" helix.theme "set-language" helix.set-language)
-    (list "set-option" helix.set-option "toggle-option" helix.toggle-option)
-    (list "change-current-directory" helix.change-current-directory)
-    (list "format" helix.format "redraw" helix.redraw)
-    (list "config-open" helix.config-open "log-open" helix.log-open)))
+;; Command name to the procedure Helix registered for it, filled as names are
+;; asked for.
+(define *resolved-commands* (box (hash)))
 
-(define command-table (apply hash command-entries))
+;;;; User configuration ;;;;
+
+;; Every setter takes names one per argument or as a single list, and hands
+;; the list straight on: config.scm accepts either form.
+
+;;@doc
+;; Allow further commands over the wire, on top of the defaults.
+;;
+;; ```scheme
+;; (remote-allow! "yank" "reflow")
+;; (remote-allow! (list "yank" "reflow"))
+;; ```
+(define (remote-allow! . names)
+  (config-allow! names)
+  (warn-if-running!))
+
+;;@doc
+;; Refuse commands that would otherwise be allowed. A denied name is refused
+;; whatever else it appears on.
+(define (remote-deny! . names)
+  (config-deny! names)
+  (warn-if-running!))
+
+;;@doc
+;; Lift a name out of the shipped deny list, one name at a time, so `write`
+;; and the rest can be reached. A name also passed to `remote-deny!` stays
+;; denied.
+(define (remote-allow-denied! . names)
+  (config-allow-denied! names)
+  (warn-if-running!))
+
+;;@doc
+;; Allow every typable command Helix knows rather than the listed ones. The
+;; deny list still applies, so this alone reaches no write and no shell.
+(define (remote-allow-all! [on #t])
+  (config-allow-all! on)
+  (warn-if-running!))
+
+;;@doc
+;; Allow `eval`, which evaluates arbitrary Steel against the editor. Off by
+;; default: it hands any local process the whole engine.
+(define (remote-allow-eval! [on #t])
+  (config-allow-eval! on)
+  (warn-if-running!))
+
+;; Configuration is read by remote-start, so say so rather than leave a call
+;; that looks like it took effect.
+(define (warn-if-running!)
+  (when (unbox *server*)
+    (set-status! "remote: configuration applies at the next :remote-start")))
+
+;; Read the configuration once, into the boxes the running server consults.
+(define (snapshot-policy!)
+  (set-box! *allowed-commands* (effective-allowed))
+  (set-box! *allow-any-command* (allow-all?)))
+
+;;;; Resolving commands ;;;;
+
+;; Look up the procedure Helix registered for a typable command name.
+;;
+;; helix/core/typable holds every entry of Helix's typable command list under
+;; its own name, but a prefixed require-builtin does not resolve inside a
+;; required module, so reach it through the engine's top level as
+;; set-process-env-var! above does. The name has been through
+;; valid-command-name? and the prefix confines the lookup to that one module,
+;; so the string can only ever name a typable command. A name Helix does not
+;; have raises FreeIdentifier.
+(define (look-up-command name)
+  (eval-string
+    (string-append "(begin (require-builtin helix/core/typable as hx-remote-typable.)"
+      " hx-remote-typable."
+      name
+      ")")))
+
+;; The procedure for a name already resolved, or #f.
+(define (command-procedure name)
+  (if (hash-contains? (unbox *resolved-commands*) name)
+    (hash-ref (unbox *resolved-commands*) name)
+    #f))
+
+;; Resolve a name and remember the answer, #f included, so a name Helix does
+;; not have is not looked up twice. Returns the procedure, or #f.
+;;
+;; eval-string reaches into the engine, and only the editor's thread may do
+;; that: run from the accept loop's own thread it takes the thread down
+;; silently and the server stops answering anything at all. hx.block-on-task
+;; marshals it across, the same crossing run-editor-command makes.
+(define (resolve-command! name)
+  (when (and (valid-command-name? name)
+         (not (hash-contains? (unbox *resolved-commands*) name)))
+    (set-box! *resolved-commands*
+      (hash-insert (unbox *resolved-commands*)
+        name
+        (with-handler (lambda (_) #f)
+          (hx.block-on-task (lambda () (with-handler (lambda (_) #f) (look-up-command name))))))))
+  (command-procedure name))
 
 ;;;; Running commands ;;;;
 
@@ -95,18 +176,28 @@
 ;; native thread, so everything touching the editor goes through
 ;; hx.block-on-task, which marshals the call onto the main loop and waits for
 ;; it. Returns a line for the client.
+;;
+;; The typable builtins take their arguments as one list, unlike the variadic
+;; wrappers in helix/commands.scm, so args is passed rather than applied.
+;;
+;; The name is already resolved: the dispatcher asks known-command? first,
+;; and that is what resolves.
 (define (run-editor-command name args)
-  ;; No internal defines: binding a module-level table together with a
+  ;; No internal defines: binding a module-level value together with a
   ;; parameter inside a provided function panics Helix's Steel compiler
   ;; (analysis.rs, visit_define_without_body). Looking the command up inline
   ;; avoids the binding altogether.
-  (hx.block-on-task (lambda () (apply (hash-ref command-table name) args)))
+  (hx.block-on-task (lambda () ((command-procedure name) args)))
   (string-append "ok " name))
 
-;; Whether a name is one this server will run at all. The dispatcher asks
-;; before calling the runner, so an unknown name is refused without raising.
+;; Whether a name is one this server will run at all: allowed by the policy it
+;; started with, and known to this Helix. The dispatcher asks before calling
+;; the runner, so an unknown name is refused without raising.
 (define (known-command? name)
-  (hash-contains? command-table name))
+  (if (and (or (unbox *allow-any-command*) (member name (unbox *allowed-commands*)))
+       (resolve-command! name))
+    #t
+    #f))
 
 ;; Evaluate Steel on the editor's thread and render the result.
 (define (evaluate-expression expr)
@@ -133,32 +224,34 @@
   (if (unbox *server*)
     (set-status! (string-append "remote: already running on "
                   (server-address (unbox *server*))))
-    (let* ([session (or name (default-session-name))]
-           [token (generate-token)]
-           [config (hash 'token token
-                    'session
-                    session
-                    'runner
-                    run-editor-command
-                    'known?
-                    known-command?
-                    'evaluator
-                    (if (unbox *eval-enabled*) evaluate-expression #f)
-                    'denied
-                    (default-denied-commands))]
-           [server (start-server host base-port (make-dispatcher config))])
-      (if server
-        (begin
-          (write-session! session host (server-port server) token (current-directory))
-          (set-box! *server* server)
-          (set-box! *session* session)
-          (set-box! *token* token)
-          ;; std::env::set_var races with getenv in a multithreaded
-          ;; process, so set these once here and never again.
-          (set-process-env-var! "HELIX_REMOTE" (server-address server))
-          (set-process-env-var! "HELIX_REMOTE_TOKEN" token)
-          (set-status! (string-append "remote: " session " on " (server-address server))))
-        (set-status! "remote: no free port")))))
+    (begin
+      (snapshot-policy!)
+      (let* ([session (or name (default-session-name))]
+             [token (generate-token)]
+             [config (hash 'token token
+                      'session
+                      session
+                      'runner
+                      run-editor-command
+                      'known?
+                      known-command?
+                      'evaluator
+                      (if (eval-allowed?) evaluate-expression #f)
+                      'denied
+                      (effective-denied))]
+             [server (start-server host base-port (make-dispatcher config))])
+        (if server
+          (begin
+            (write-session! session host (server-port server) token (current-directory))
+            (set-box! *server* server)
+            (set-box! *session* session)
+            (set-box! *token* token)
+            ;; std::env::set_var races with getenv in a multithreaded
+            ;; process, so set these once here and never again.
+            (set-process-env-var! "HELIX_REMOTE" (server-address server))
+            (set-process-env-var! "HELIX_REMOTE_TOKEN" token)
+            (set-status! (string-append "remote: " session " on " (server-address server))))
+          (set-status! "remote: no free port"))))))
 
 ;;@doc
 ;; Stop the remote listener and remove its session file.

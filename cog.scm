@@ -21,7 +21,7 @@
 ;;;   (remote-start)
 
 (define package-name 'remote.hx)
-(define version "0.1.0")
+(define version "0.2.0")
 
 ;; No dependencies: networking, filesystem and process primitives all come
 ;; from steel-core builtins.

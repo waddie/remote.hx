@@ -53,6 +53,12 @@ check "eval is off by default" "error eval is disabled" "$($HX --eval '(+ 1 2)' 
 check "malformed names are refused" "error bad command name" "$($HX 'open; rm -rf /' || true)"
 check "unknown commands are refused" "error unknown command: frobnicate" "$($HX frobnicate || true)"
 
+# The server was configured with (config-allow! "yank") and
+# (config-allow-denied! "write-all").
+check "a configured command reaches the runner" "ran yank" "$($HX yank)"
+check "a lifted deny reaches the runner" "ran write-all" "$($HX write-all)"
+check "the rest of the deny list stands" "error command not permitted: run-shell-command" "$($HX run-shell-command ls || true)"
+
 # A wrong token must be rejected even though the port is open.
 port=$(sed -n 's/^port=//p' "$HELIX_REMOTE_DIR/work.session")
 bad=$(printf 'wrong\ncmd\nopen\n/tmp/x\n\n' | nc 127.0.0.1 "$port")

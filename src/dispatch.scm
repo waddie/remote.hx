@@ -18,6 +18,7 @@
 ;;; takes for `server-use-tcp`.
 
 (provide
+  default-allowed-commands
   default-denied-commands
   valid-command-name?
   authorised?
@@ -41,6 +42,24 @@
     "write-all!"
     "write-quit-all"
     "write-quit-all!"))
+
+;;@doc
+;; Commands reachable over the wire without any configuration: navigation,
+;; windows, buffers and display. Nothing here writes to disk or leaves the
+;; editor. `remote-allow!` adds to this list; `remote-allow-all!` replaces it
+;; with every typable command Helix knows.
+;;
+;; Built in small groups because a call with nine or more arguments inside a
+;; required module corrupts the next call's arguments in this Steel build.
+(define (default-allowed-commands)
+  (append
+    (list "open" "new" "goto" "echo")
+    (list "buffer-next" "buffer-previous" "buffer-close" "buffer-close!")
+    (list "buffer-close-others" "vsplit" "hsplit")
+    (list "vsplit-new" "hsplit-new" "quit" "quit!")
+    (list "reload" "reload-all" "theme" "set-language")
+    (list "set-option" "toggle-option" "change-current-directory")
+    (list "format" "redraw" "config-open" "log-open")))
 
 ;; Characters a typable command name may contain. Steel has no
 ;; `char-alphabetic?`, so compare code points directly.

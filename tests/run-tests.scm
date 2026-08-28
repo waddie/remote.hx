@@ -10,6 +10,7 @@
 
 (require "steel-test/test.scm")
 
+(require "config-test.scm")
 (require "dispatch-test.scm")
 (require "discovery-test.scm")
 

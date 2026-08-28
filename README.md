@@ -67,18 +67,57 @@ hx-send open src/main.rs && hx-send goto 120
 
 ## What can be run
 
-Only the commands in the table in `remote.scm`, and never those on the deny
-list (`write`, the other writing commands, and `run-shell-command`). Anything
-else is refused with `error unknown command`.
+Only the commands on the allow list, and never those on the deny list
+(`write`, the other writing commands, and `run-shell-command`). Anything else
+is refused with `error unknown command`.
 
-To allow another command, add it to `command-entries` in `remote.scm`.
+The allow list ships with the navigation, window, buffer, and display commands:
 
-`eval`, which evaluates arbitrary Steel against the editor, is off by default;
-it hands any local process the whole engine. Turn it on before starting:
+```
+open  new  goto  echo  buffer-next  buffer-previous  buffer-close
+buffer-close!  buffer-close-others  vsplit  hsplit  vsplit-new  hsplit-new
+quit  quit!  reload  reload-all  theme  set-language  set-option
+toggle-option  change-current-directory  format  redraw  config-open  log-open
+```
+
+Change it from `~/.config/helix/init.scm`, before `remote-start`:
 
 ```scheme
-(set-box! *eval-enabled* #t)
+(require "remote.hx/remote.scm")
+
+(remote-allow! "reflow" "sort")     ; allow more commands
+(remote-deny! "config-open")        ; refuse ones that would be allowed
+(remote-allow-denied! "write")      ; lift a deny, one name at a time
+(remote-allow-all!)                 ; allow every command Helix has
+(remote-allow-eval!)                ; allow eval, see below
+
+(remote-start)
 ```
+
+Each of these also takes a list, for a list too long to pass as arguments:
+
+```scheme
+(remote-allow! (list "reflow" "sort" "sort-reverse"))
+```
+
+`remote-allow-all!` and `remote-allow-eval!` take an optional boolean, so both
+can be switched back off.
+
+A denied command is refused whatever else it appears on, so `remote-deny!`
+always wins over `remote-allow!` and over `remote-allow-denied!`, whichever
+order they are called in. `remote-allow-all!` reaches no write and no shell:
+those stay on the deny list until named to `remote-allow-denied!` one at a
+time.
+
+Names are Helix’s own typable command names, the ones you would type after a
+colon. A name Helix does not have is refused as unknown.
+
+The configuration is read once, by `remote-start`. Each of these is also a
+typable command, so `:remote-allow reflow` works from the editor, but it
+applies at the next `:remote-start` rather than to the server already running.
+
+`eval` evaluates arbitrary Steel against the editor, and is off by default: it
+hands any local process the whole engine.
 
 ## Session files
 
@@ -121,7 +160,7 @@ Verbs are `cmd` (run a command named by the first argument), `eval`, `ping` and
 - A command that raises inside the editor still returns its error, but the
   connection stays open until Steel collects it. `hx-send` bounds that wait
   (`HX_SEND_TIMEOUT`, five seconds by default).
-- The token is sent as plain text over loopback, as Emacs' is.
+- The token is sent as plain text over loopback, as Emacs’ is.
 
 ## Tests
 

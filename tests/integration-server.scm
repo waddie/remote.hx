@@ -7,7 +7,13 @@
 (require "../src/server.scm")
 (require "../src/discovery.scm")
 (require "../src/dispatch.scm")
+(require "../src/config.scm")
 (require-builtin steel/time)
+
+;; Configured the way an init.scm would, so the socket suite covers a server
+;; whose policy came from config.scm and not only the shipped one.
+(config-allow! "yank")
+(config-allow-denied! "write-all")
 
 ;; Stands in for the editor: echoes what it was asked to run so the test can
 ;; assert the arguments survived the wire intact.
@@ -17,7 +23,7 @@
 (define session (if (> (length (command-line)) 2) (list-ref (command-line) 2) "test"))
 (define token (generate-token))
 
-(define (known? name) (member name (list "open" "goto" "write" "run-shell-command")))
+(define (known? name) (member name (effective-allowed)))
 
 (define config
   (hash 'token token
@@ -30,7 +36,7 @@
     'evaluator
     #f
     'denied
-    (default-denied-commands)))
+    (effective-denied)))
 
 (define server (start-server "127.0.0.1" 7979 (make-dispatcher config)))
 
