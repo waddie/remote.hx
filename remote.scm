@@ -30,7 +30,8 @@
 (require "src/dispatch.scm")
 (require "src/config.scm")
 
-(provide remote-start
+(provide
+  remote-start
   remote-stop
   remote-status
   remote-list
@@ -183,10 +184,6 @@
 ;; The name is already resolved: the dispatcher asks known-command? first,
 ;; and that is what resolves.
 (define (run-editor-command name args)
-  ;; No internal defines: binding a module-level value together with a
-  ;; parameter inside a provided function panics Helix's Steel compiler
-  ;; (analysis.rs, visit_define_without_body). Looking the command up inline
-  ;; avoids the binding altogether.
   (hx.block-on-task (lambda () ((command-procedure name) args)))
   (string-append "ok " name))
 
